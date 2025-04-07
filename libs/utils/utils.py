@@ -120,7 +120,7 @@ def get_data(folder_path, key):
 
     file_path = os.path.join(folder_path, f"{key}.pt")
     if os.path.exists(file_path):
-        return torch.load(file_path)
+        return torch.load(file_path, weights_only=False)
     else:
         return None
 

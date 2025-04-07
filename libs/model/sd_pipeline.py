@@ -246,6 +246,8 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                     'all_latents'].keys(), f"timestep {step_timestep} not in inverse samples keys"
                 data_samples_latent: torch.Tensor = inverted_data['condition_input'][0]['all_latents'][step_timestep]
                 data_samples_latent = data_samples_latent.to(device=self.running_device, dtype=prompt_embeds.dtype)
+                
+                coords_tensor = inverted_data['landmark']
 
                 if config.data.inversion.method == 'DDIM':
                     if i == 0 and same_latent and config.sd_config.appearnace_same_latent:
@@ -317,7 +319,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                         loss += pca_loss
                     elif select_feature == 'conv':
                         pca_loss = self.compute_conv_pca_loss(cond_control_ids, cond_example_ids, cond_appearance_ids,
-                                                              i)
+                                                              i, coords_tensor)
                         loss += pca_loss
 
                 temp_control_ids = None
@@ -377,9 +379,9 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
         # Currently only support one pca path
         path = self.input_config.sd_config.pca_paths[0]
         self.loaded_pca_info = torch.load(path)
-
+    # structured loss
     def _compute_feat_loss(self, feat, pca_info, cond_control_ids, cond_example_ids, cond_appearance_ids, step,
-                           reg_included=False, reg_feature=None, ):
+                           reg_included=False, reg_feature=None ):
         feat_copy = feat if reg_feature is None else reg_feature
         loss: List[torch.Tensor] = []
         # Feat in the shape [bs,h*w,channels]
@@ -433,8 +435,12 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                     ref_mask = example_token_probs > self.guidance_config.pca_guidance.structure_guidance.mask_tr
                     ref_mask = ref_mask.to(self.running_device).unsqueeze(-1).repeat(num_control_samples,
                                                                                      1, ref_feat.shape[-1])
-
-                # Compute the loss
+                    
+                
+                # ref_feat torch.Size([1, 256, 64])
+                # feat_proj torch.Size([1, 256, 64])
+                
+                # Compute the loss ❤️
                 temp_loss: torch.Tensor = F.mse_loss(ref_feat[ref_mask], feat_proj[cond_control_ids][ref_mask])
 
                 # Compute l2 penalty loss
@@ -515,7 +521,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
         loss = torch.stack(loss).sum()
         return loss
 
-    def compute_conv_pca_loss(self, cond_control_ids, cond_example_ids, cond_appearance_ids, step_i):
+    def compute_conv_pca_loss(self, cond_control_ids, cond_example_ids, cond_appearance_ids, step_i, coords_tensor):
         """
         Compute the PCA Conv loss based on the given condition control, example, and appearance IDs.
 
@@ -552,6 +558,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                 loss = self._compute_feat_loss(conv_feat, conv_pca_info, new_cond_control_ids, new_cond_example_ids,
                                                new_cond_appearance_ids, step_i, reg_included=True,
                                                reg_feature=[conv_feat])
+                
                 total_loss.append(loss)
         weight = float(self.guidance_config.pca_guidance.weight)
         if self.guidance_config.pca_guidance.warm_up.apply and step_i < self.guidance_config.pca_guidance.warm_up.end_step:

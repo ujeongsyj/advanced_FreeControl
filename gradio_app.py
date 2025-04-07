@@ -25,7 +25,12 @@ def freecontrol_generate(condition_image, prompt, scale, ddim_steps, sd_version,
     control_type = condition
 
     if not control_type == "None":
-        processor = make_processor(control_type.lower())
+        if control_type.lower() == "landmark" :
+            processor = make_processor("openpose")
+            landmark2d_processor = make_processor("landmark")
+            
+        else:
+            processor = make_processor(control_type.lower())
     else:
         processor = lambda x: Image.open(x).convert("RGB") if type(x) == str else x
 
@@ -91,16 +96,34 @@ def freecontrol_generate(condition_image, prompt, scale, ddim_steps, sd_version,
 
     # create a inversion config
     inversion_config = config.data.inversion
-
+    
     # Processor the condition image
-    img = processor(condition_image)
+    
+    coords_tensor = None
+    if control_type.lower() == 'landmark':  
+        img = processor(condition_image)
+        landmark2d_img, landmark2d = landmark2d_processor(condition_image)
+        original_w, original_h = img.size  # ex: 512 x 512
+        condition_image_latents = pipeline.invert(img=img, inversion_config=inversion_config) # dict_keys(['prompt', 'all_latents', 'img', 'pil_img', 'prompt_embeds'])
+        # scaling
+        last_latent = list(condition_image_latents['all_latents'].values())[-1]
+        _, _, latent_h, latent_w = last_latent.shape  # torch.Size([1, 4, 64, 64])
+        coords_tensor = landmark2d.clone()
+        coords_tensor[:, 0] *= latent_w / original_w
+        coords_tensor[:, 1] *= latent_h / original_h
+        
+        
+    else: img = processor(condition_image)
     # flip the color for the scribble and canny: black background to white background
     if control_type == "scribble" or control_type == "canny":
         img = Image.fromarray(255 - np.array(img))
+        condition_image_latents = pipeline.invert(img=img, inversion_config=inversion_config)
+        
 
-    condition_image_latents = pipeline.invert(img=img, inversion_config=inversion_config)
+    # condition_image_latents = pipeline.invert(img=img, inversion_config=inversion_config)
+    
 
-    inverted_data = {"condition_input": [condition_image_latents], }
+    inverted_data = {"condition_input": [condition_image_latents], "landmark":[coords_tensor]}
 
     g = torch.Generator()
     g.manual_seed(config.sd_config.seed)
@@ -202,7 +225,7 @@ def main():
             with gr.Column():
                 # Add condition image from user input
                 input_image = gr.Image(label="Input Condition Image", type="pil", interactive=True,
-                                       value=Image.open("dataset/example_dog.jpg") if os.path.exists("dataset/example_dog.jpg") else None)
+                                       value=Image.open("dataset/won.jpg") if os.path.exists("dataset/won.jpg") else None)
 
                 # Select the SD Version, Model Checkpoint and PCA Basis
                 sd_version = gr.Radio(list(model_dict.keys()), label="Select a Base Model", value="1.5")
@@ -223,14 +246,14 @@ def main():
 
             with gr.Column():
                 prompt = gr.Textbox(label="Generation Prompt: prompt to generate target image",
-                                    value="A photo of a lion, in the desert, best quality, extremely detailed")
+                                    value="A photo of a women with pink hair")
                 inversion_prompt = gr.Textbox(label="Inversion Prompt to invert the condition image",
-                                              value="A photo of a dog")
+                                              value="A photo of a women")
                 paired_objs = gr.Textbox(
                     label="Paired subject: Please selected the paired subject from the inverson prompt and generation prompt."
                           "Then input in the format like (obj from inversion prompt; obj from generation prompt)"
                           "e.g. (dog; lion)",
-                    value="(dog; lion)")
+                    value="(women; women with pink hair)")
                 run_button = gr.Button(value="Run")
                 with gr.Accordion("options", open=True):
                     scale = gr.Slider(label="Guidance Scale", minimum=0.1, maximum=30.0, value=7.5, step=0.1)
@@ -238,9 +261,9 @@ def main():
                     img_size = gr.Slider(label="Image Size", minimum=256, maximum=1024, value=512, step=64)
 
                     condition = gr.Radio(
-                        choices=["None", "Scribble", "Depth", "Hed", "Seg", "Canny", "Normal", "Openpose"],
+                        choices=["None", "Scribble", "Depth", "Hed", "Seg", "Canny", "Normal", "Openpose","Landmark"],
                         label="Condition Type: extract condition on the input image", value="None")
-
+                    
                     seed = gr.Slider(label="Seed", minimum=0, maximum=100000, value=2028, step=1)
 
                     # PCA Q,K guidance parameters

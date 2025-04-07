@@ -14,6 +14,10 @@ import copy
 import cv2
 from abc import ABC, abstractmethod
 
+# add
+import mediapipe as mp
+
+
 palette = np.asarray([
     [0, 0, 0],
     [120, 120, 120],
@@ -199,6 +203,42 @@ class Openposedetector(Processor):
         image = openpose(image)
         condition_image = image
         return condition_image
+    
+# add
+@register_processor("landmark")
+class Landmarkdetector(Processor):
+
+    def get_controlnet_id(self):
+        return None
+
+    def __call__(self, img_path):
+        image_pil = load_image(img_path)
+
+        image = np.array(image_pil)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)  # BGR로 변환 (mediapipe는 RGB 사용)
+        h, w, _ = image.shape
+
+        # 3. 랜드마크 이미지 초기화
+        landmark_img = np.zeros_like(image)
+
+        # 4. 얼굴 랜드마크 추출
+        mp_face_mesh = mp.solutions.face_mesh
+        with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
+            results = face_mesh.process(image_rgb)
+
+            coords_tensor = None
+            if results.multi_face_landmarks:
+                landmarks = results.multi_face_landmarks[0]
+                coords = []
+                for pt in landmarks.landmark:
+                    x = int(pt.x * w)
+                    y = int(pt.y * h)
+                    coords.append([x, y])
+                    cv2.circle(landmark_img, (x, y), 2, (255, 255, 255), -1)
+
+                coords_tensor = torch.tensor(coords, dtype=torch.float32)  # (468, 2)
+        condition_image = Image.fromarray(landmark_img)
+        return condition_image, coords_tensor
 
 
 @register_processor("depth")
