@@ -63,8 +63,18 @@ def get_conv_feat(unet):
 
 
 def prep_unet_conv(unet):
+    # ✅ up_blocks hook
     for i in range(len(unet.up_blocks)):
         for j in range(len(unet.up_blocks[i].resnets)):
             module = unet.up_blocks[i].resnets[j]
             module.forward = conv_forward(module)
+
+    # ✅ down_blocks hook 
+    for i in range(len(unet.down_blocks)):
+        for j in range(len(unet.down_blocks[i].resnets)):
+            module = unet.down_blocks[i].resnets[j]
+            module.forward = conv_forward(module)
+
     return unet
+
+

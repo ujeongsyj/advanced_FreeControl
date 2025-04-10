@@ -52,13 +52,23 @@ guidance:
       apply: False                # Whether apply adaptive self-attention injection
       adaptive_p: 1               # power of the adaptive threshold
     blocks:                       # Blocks for self-attention injection
-      ["up_blocks.1"]
+      ["up_blocks.1","down_blocks.0.resnets.0"]
     appearance_guidance:          # Parameters for texture regulation
       apply: True                 # Whether apply texture regulation
       reg_factor: 0.05            # Regularization factor
       tr: 0.5
       cross_attn_mask_tr: 0.3
       app_n_components: 2         # Number of leading components used to extract mean appearance feature
+    
+    landmark_guidance:  #  landmark 전용 세부 항목 추가!
+      apply: True
+      weight: 800            # landmark 기반 전체 loss 가중치
+      lambda_landmark: 1.0   # per-block feature loss 스케일
+      use_soft_mask: True
+      mask_sigma: 1.0        # Gaussian sigma for soft masking
+      mask_radius: 5         # 마스크 kernel 크기 (e.g., 5x5)
+      target_blocks:
+        - down_blocks.0.resnets.0
 
   cross_attn:
     start_step: 0                 # Start step for cross-attention guidance

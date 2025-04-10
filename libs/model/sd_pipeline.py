@@ -247,7 +247,12 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                 data_samples_latent: torch.Tensor = inverted_data['condition_input'][0]['all_latents'][step_timestep]
                 data_samples_latent = data_samples_latent.to(device=self.running_device, dtype=prompt_embeds.dtype)
                 
-                coords_tensor = inverted_data['landmark']
+                if "landmark" in inverted_data.keys(): 
+                    coords_tensor = inverted_data['landmark'][0]
+        
+                    original_h = inverted_data['original_size'][0] 
+                    original_w = inverted_data['original_size'][1]
+                    print("original:", original_h,original_w) #1200 912
 
                 if config.data.inversion.method == 'DDIM':
                     if i == 0 and same_latent and config.sd_config.appearnace_same_latent:
@@ -271,6 +276,37 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                     raise NotImplementedError("Currently only support DDIM method")
 
                 step_prompt_embeds = torch.cat(step_prompt_embeds_list, dim=0).to('cuda')
+                
+                # [1] Reference feature 저장 (딱 한 번)
+                if 'reference_input' in inverted_data:
+                    refer_latent = inverted_data['reference_input'][0]['all_latents']
+                    refer_latent = list(refer_latent.values())[-1].to(device=self.running_device, dtype=prompt_embeds.dtype)
+                    
+                    if i == 0:
+                        dummy_prompt_embed = torch.zeros((1, 77, self.unet.config.cross_attention_dim), device=self.running_device, dtype=prompt_embeds.dtype)
+                        self.reference_hidden_states = {}
+                        with torch.no_grad():
+                            ref_latent_scaled = self.scheduler.scale_model_input(refer_latent, t)
+                            _ = self.unet(
+                                ref_latent_scaled,
+                                t,
+                                encoder_hidden_states=dummy_prompt_embed,
+                                return_dict=False
+                            )
+
+                        for block_name in self.guidance_config.pca_guidance.blocks:
+                            if "up_blocks" in block_name:
+                                block_id = int(block_name.split(".")[1])
+                                for j in range(len(self.unet.up_blocks[block_id].resnets)):
+                                    name = f"up_blocks.{block_id}.resnets.{j}"
+                                    self.reference_hidden_states[name] = self.unet.up_blocks[block_id].resnets[j].record_hidden_state.detach()
+
+                            elif "down_blocks" in block_name:
+                                block_id = int(block_name.split(".")[1])
+                                for j in range(len(self.unet.down_blocks[block_id].resnets)):
+                                    name = f"down_blocks.{block_id}.resnets.{j}"
+                                    self.reference_hidden_states[name] = self.unet.down_blocks[block_id].resnets[j].record_hidden_state.detach()
+                ###
 
                 require_grad_flag = False
                 # Check if the current step is in the guidance step
@@ -299,6 +335,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                         )[0]
 
                 # Compute loss
+                
                 loss = 0
                 self.cross_seg = None
                 if _in_step(self.guidance_config.cross_attn, i):
@@ -312,15 +349,36 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                         select_feature = self.guidance_config.pca_guidance.select_feature
                     except:
                         select_feature = "key"
-
+                    
+                    #structure loss + appearance loss
                     if select_feature == 'query' or select_feature == 'key' or select_feature == 'value':
                         pca_loss = self.compute_attn_pca_loss(cond_control_ids, cond_example_ids, cond_appearance_ids,
                                                               i)
                         loss += pca_loss
+                        
                     elif select_feature == 'conv':
                         pca_loss = self.compute_conv_pca_loss(cond_control_ids, cond_example_ids, cond_appearance_ids,
-                                                              i, coords_tensor)
+                                                              i)
                         loss += pca_loss
+                    
+                    #landmark loss
+                    if "landmark" in inverted_data:
+                        if coords_tensor is not None:
+                            print("landmark 실행===")
+                            
+                            # soft mask + landmark
+                            sigma = 1.0
+                            landmark_loss = self.compute_attn_landmark_loss(cond_control_ids, cond_example_ids, cond_appearance_ids, i, coords_tensor, original_h, original_w, sigma)
+                            loss += landmark_loss * 0.5
+                            '''
+                            # conv+landmark
+                            landmark_loss = self.compute_conv_landmark_loss(
+                                cond_control_ids, cond_example_ids, cond_appearance_ids,
+                                i, coords_tensor, original_h, original_w)
+                            loss += landmark_loss * 0.05   #[DEBUG] Landmark loss [down_blocks.0.resnets.0] shape: torch.Size([1, 281, 320]), loss: 0.073242
+                            '''
+                            
+
 
                 temp_control_ids = None
                 if isinstance(loss, torch.Tensor):
@@ -355,10 +413,13 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
         if not output_type == "latent":
             with torch.no_grad():
                 image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-                image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+                #image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+                # 그냥 무시하고 진행
+                has_nsfw_concept = [False] * image.shape[0]
         else:
             image = latents
             has_nsfw_concept = None
+            
 
         if has_nsfw_concept is None:
             do_denormalize = [True] * image.shape[0]
@@ -379,7 +440,8 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
         # Currently only support one pca path
         path = self.input_config.sd_config.pca_paths[0]
         self.loaded_pca_info = torch.load(path)
-    # structured loss
+        
+    # loss 계산
     def _compute_feat_loss(self, feat, pca_info, cond_control_ids, cond_example_ids, cond_appearance_ids, step,
                            reg_included=False, reg_feature=None ):
         feat_copy = feat if reg_feature is None else reg_feature
@@ -391,9 +453,12 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
 
         # print(feat.shape)
         centered_feat = feat - feat_mean
+        
         # Compute the projection
-        feat_proj = torch.matmul(centered_feat, feat_basis.T)
-
+        feat_proj = torch.matmul(centered_feat, feat_basis.T)   #st
+        
+        
+        # structured loss
         if self.guidance_config.pca_guidance.structure_guidance.normalized:
             # Normalize the projection by the max and min value
             feat_proj = feat_proj.permute(0, 2, 1)
@@ -403,10 +468,10 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
             feat_proj = feat_proj.permute(0, 2, 1)
         feat_proj = feat_proj[:, :, :n_components]
 
-        if self.guidance_config.pca_guidance.structure_guidance.mask_tr > 0:
+        if self.guidance_config.pca_guidance.structure_guidance.mask_tr > 0:   #여기
             # Get the activation mask for each component
             # Check the policy for pca guidance
-            if self.input_config.data.inversion.policy == 'share':
+            if self.input_config.data.inversion.policy == 'share':    #여기
 
                 ref_feat = feat_proj[cond_example_ids].mean(dim=0, keepdim=True)
                 num_control_samples: int = len(cond_control_ids)
@@ -415,7 +480,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                 # Select the mask for the control samples
                 if self.guidance_config.pca_guidance.structure_guidance.mask_type == 'tr':
                     ref_mask = ref_feat > self.guidance_config.pca_guidance.structure_guidance.mask_tr
-                elif self.guidance_config.pca_guidance.structure_guidance.mask_type == 'cross_attn':
+                elif self.guidance_config.pca_guidance.structure_guidance.mask_type == 'cross_attn':   #여기
                     # Currently, only take the first object pair
                     obj_pair = self.record_obj_pairs[0]
                     example_token_ids = obj_pair['ref']
@@ -446,7 +511,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                 # Compute l2 penalty loss
                 penalty_factor: float = float(self.guidance_config.pca_guidance.structure_guidance.penalty_factor)
                 fliped_mask = ~ref_mask
-                if self.guidance_config.pca_guidance.structure_guidance.penalty_type == 'max':
+                if self.guidance_config.pca_guidance.structure_guidance.penalty_type == 'max':   #여기기
                     # Compute the max value in the fliped_mask
                     score1 = (feat_proj[cond_example_ids] * fliped_mask).max(dim=1, keepdim=True)[0]
                     score2 = F.relu((feat_proj[cond_control_ids] * fliped_mask) - score1)
@@ -462,7 +527,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                     temp_loss += penalty_loss
                 else:
                     raise NotImplementedError("Only max penalty type has been implemented")
-                loss.append(temp_loss)
+                loss.append(temp_loss)    #gs
 
             else:
                 raise NotImplementedError("Only \'share\' policy has been implemented")
@@ -486,11 +551,12 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                 raise NotImplementedError("Only \'share\' policy has been implemented")
 
             loss.append(temp_loss)
-
+            
+        #apperance loss
         # Compute the texture regularization loss
         reg_factor = float(self.guidance_config.pca_guidance.appearance_guidance.reg_factor)
-        if reg_included and reg_factor > 0:
-            app_n_components = self.guidance_config.pca_guidance.appearance_guidance.app_n_components
+        if reg_included and reg_factor > 0:  #여기
+            app_n_components = self.guidance_config.pca_guidance.appearance_guidance.app_n_components  #2
 
             def compute_app_loss(feature, weights, tr, control_ids, appearance_ids):
                 """
@@ -516,12 +582,14 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                                                            self.guidance_config.pca_guidance.appearance_guidance.tr,
                                                            cond_control_ids, cond_appearance_ids)
                 temp_loss_list.append(temp_loss)
-            temp_loss = torch.stack(temp_loss_list).mean()
+            temp_loss = torch.stack(temp_loss_list).mean()  #ga
             loss.append(temp_loss * reg_factor)
+            
         loss = torch.stack(loss).sum()
         return loss
-
-    def compute_conv_pca_loss(self, cond_control_ids, cond_example_ids, cond_appearance_ids, step_i, coords_tensor):
+    
+    
+    def compute_conv_pca_loss(self, cond_control_ids, cond_example_ids, cond_appearance_ids, step_i):
         """
         Compute the PCA Conv loss based on the given condition control, example, and appearance IDs.
 
@@ -558,7 +626,6 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                 loss = self._compute_feat_loss(conv_feat, conv_pca_info, new_cond_control_ids, new_cond_example_ids,
                                                new_cond_appearance_ids, step_i, reg_included=True,
                                                reg_feature=[conv_feat])
-                
                 total_loss.append(loss)
         weight = float(self.guidance_config.pca_guidance.weight)
         if self.guidance_config.pca_guidance.warm_up.apply and step_i < self.guidance_config.pca_guidance.warm_up.end_step:
@@ -566,7 +633,199 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
         loss = torch.stack(total_loss).mean()
         loss = loss * weight
         return loss
+    
+    #add
+    def extract_landmark_features_from_latent(self,conv_feat: torch.Tensor, coords_tensor: torch.Tensor):
+        """
+        conv_feat: [B, C, H, W]
+        coords_tensor: [N, 2] in (x, y), already scaled to latent size
+        returns: [B, N, C]
+        """
+        B, C, H, W = conv_feat.shape
+        coords_tensor = coords_tensor.long()
+        x = coords_tensor[:, 0].clamp(0, W - 1)
+        y = coords_tensor[:, 1].clamp(0, H - 1)
 
+        landmark_feats = []
+        for b in range(B):
+            feat = conv_feat[b, :, y, x]  # [C, N]
+            landmark_feats.append(feat.T)  # [N, C]
+        return torch.stack(landmark_feats)  # [B, N, C]
+    
+    
+    def _attn_landmark_loss_with_mask(self, conv_feat, reference_feat, coords_tensor, sigma):
+        """
+        Internal function to compute weighted MSE loss using soft landmark mask.
+
+        Args:
+            conv_feat (Tensor): [B, C, H, W]
+            reference_feat (Tensor): [1, C, H, W]
+            coords_tensor (Tensor): [N, 2]
+            sigma (float): Gaussian spread
+        Returns:
+            torch.Tensor: scalar loss
+        """
+        B, C, H, W = conv_feat.shape
+        device = conv_feat.device
+
+        # === Create soft mask
+        yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+        heatmap = torch.zeros((H, W), device=device)
+
+        for x, y in coords_tensor:
+            g = torch.exp(-((xx - x)**2 + (yy - y)**2) / (2 * sigma**2))
+            heatmap += g
+
+        heatmap = heatmap.clamp(0, 1)
+        mask = heatmap[None, None, :, :]  # [1, 1, H, W]
+
+        # === Apply mask
+        feat_gen = conv_feat * mask  # [B, C, H, W]
+        feat_ref = reference_feat * mask  # [1, C, H, W]
+
+        # === Compute weighted MSE
+        loss = F.mse_loss(feat_gen, feat_ref.expand_as(feat_gen).detach(), reduction='mean')
+        return loss
+
+    
+    def compute_attn_landmark_loss(self, cond_control_ids, cond_example_ids, cond_appearance_ids, step_i, coords_tensor, original_h, original_w, sigma):
+        """
+        Compute the landmark-based attention-weighted loss between reference and control features.
+        Uses soft spatial mask based on Gaussian around landmark positions.
+
+        :return: scalar weighted loss
+        """
+        combined_list = cond_example_ids + cond_control_ids + cond_appearance_ids
+        new_cond_example_ids = np.arange(len(cond_example_ids)).tolist()
+        new_cond_control_ids = np.arange(len(cond_example_ids), len(cond_example_ids) + len(cond_control_ids)).tolist()
+
+        total_loss = []
+
+        # load config values from landmark_guidance
+        lm_cfg = self.guidance_config.pca_guidance.landmark_guidance
+        lambda_landmark = getattr(lm_cfg, "lambda_landmark", 1.0)
+        weight = float(getattr(lm_cfg, "weight", 1.0))
+        use_soft_mask = lm_cfg.get("use_soft_mask", True)
+
+        for block_name in lm_cfg.get("target_blocks", []):
+            block_id = int(block_name.split(".")[1])
+            resnet_id = int(block_name.split(".")[-1])
+            name = f"down_blocks.{block_id}.resnets.{resnet_id}"
+
+            if not hasattr(self.unet.down_blocks[block_id].resnets[resnet_id], "record_hidden_state"):
+                continue
+
+            conv_feat = self.unet.down_blocks[block_id].resnets[resnet_id].record_hidden_state
+            conv_feat = conv_feat[combined_list]  # [B, C, H, W]
+
+            if coords_tensor is None or name not in self.reference_hidden_states:
+                continue
+
+            ref_feat = self.reference_hidden_states[name]  # [1, C, H, W]
+
+            _, _, H, W = conv_feat.shape
+            coords_scaled = coords_tensor.clone()
+            coords_scaled = coords_scaled.clamp(0, W - 1)
+
+            # === Soft attention weighted landmark loss ===
+            loss = self._attn_landmark_loss_with_mask(
+                conv_feat=conv_feat[new_cond_control_ids],
+                reference_feat=ref_feat,
+                coords_tensor=coords_scaled,
+                sigma=sigma if use_soft_mask else None
+            )
+
+            total_loss.append(loss * lambda_landmark)
+
+        if not total_loss:
+            return torch.tensor(0.0, device=self.running_device)
+
+        # warm-up weight scaling
+        if self.guidance_config.pca_guidance.warm_up.apply and step_i < self.guidance_config.pca_guidance.warm_up.end_step:
+            weight *= (step_i / self.guidance_config.pca_guidance.warm_up.end_step)
+
+        return torch.stack(total_loss).mean() * weight
+
+
+
+    def compute_conv_landmark_loss(self, cond_control_ids, cond_example_ids, cond_appearance_ids, step_i, coords_tensor, original_h, original_w):
+        """
+        Compute the landmark-based conv loss between reference and control.
+        PCA projection은 제거되고 landmark 비교만 수행.
+
+        :param cond_control_ids:
+        :param cond_example_ids:
+        :param cond_appearance_ids:
+        :param step_i: diffusion step
+        :param coords_tensor: landmark coordinate tensor [N, 2]
+        :param original_h: original image height
+        :param original_w: original image width
+        :return: scalar loss
+        """
+        combined_list = cond_example_ids + cond_control_ids + cond_appearance_ids
+        new_cond_example_ids = np.arange(len(cond_example_ids)).tolist()
+        new_cond_control_ids = np.arange(len(cond_example_ids), len(cond_control_ids) + len(cond_example_ids)).tolist()
+        new_cond_appearance_ids = np.arange(len(cond_control_ids) + len(cond_example_ids), len(combined_list)).tolist()
+        
+
+        total_loss = []
+
+        # === 해상도 높은 block만 사용 (예: down_blocks.0.resnets.0)
+        for block_name in ["down_blocks.0.resnets.0"]:
+            block_id = int(block_name.split(".")[1])
+            resnet_id = int(block_name.split(".")[-1])
+
+            name = f"down_blocks.{block_id}.resnets.{resnet_id}"
+
+            conv_feat = self.unet.down_blocks[block_id].resnets[resnet_id].record_hidden_state
+            conv_feat = conv_feat[combined_list]  # [B, C, H, W] conv_feat shape torch.Size([3, 320, 64, 64])
+
+            print("conv_feat shape", conv_feat.shape)  # torch.Size([B, C, H, W])
+            print("Checking conditions:")
+            print("  - coords_tensor is not None:", coords_tensor is not None)
+            print("  - hasattr(self, 'reference_hidden_states'):", hasattr(self, "reference_hidden_states"))
+            print("  - name:", name)
+            print("  - keys in reference_hidden_states:", list(self.reference_hidden_states.keys())[:5])
+            print("  - name in self.reference_hidden_states:", name in self.reference_hidden_states)
+
+
+            if coords_tensor is not None and hasattr(self, "reference_hidden_states") and name in self.reference_hidden_states:
+                _, _, H, W = conv_feat.shape
+                
+
+                # === Landmark 좌표를 latent 해상도로 스케일링 후 정수 인덱스화
+                scaled_coords = coords_tensor.clone().long()  
+                scaled_coords = torch.unique(scaled_coords, dim=0)
+
+                print("scaled_coords shape:", scaled_coords.shape)
+                print("scaled_coords[:10]:", scaled_coords[:10])
+
+                # === Reference 및 Control Feature 추출
+                ref_conv_feat = self.reference_hidden_states[name]  # [1, C, H, W]
+                feat_input = self.extract_landmark_features_from_latent(ref_conv_feat, scaled_coords)  # [1, N, C]
+                feat_gen = self.extract_landmark_features_from_latent(conv_feat[new_cond_control_ids], scaled_coords)  # [B, N, C]
+
+                # === Landmark 기준 Loss 계산
+                feat_input = feat_input.expand(feat_gen.shape[0], -1, -1)  # [B, N, C]
+                lm_loss = F.mse_loss(feat_gen, feat_input.detach())
+
+                print(f"[DEBUG] Landmark loss [{name}] shape: {feat_gen.shape}, loss: {lm_loss.item():.6f}")
+
+                lambda_landmark = getattr(self.guidance_config.pca_guidance.structure_guidance, "lambda_landmark", 1.0)
+                total_loss.append(lm_loss * lambda_landmark)
+
+        if not total_loss:
+            return torch.tensor(0.0, device=self.running_device)
+
+        # === Warm-up weight 조절
+        weight = float(self.guidance_config.pca_guidance.weight)
+        if self.guidance_config.pca_guidance.warm_up.apply and step_i < self.guidance_config.pca_guidance.warm_up.end_step:
+            weight *= (step_i / self.guidance_config.pca_guidance.warm_up.end_step)
+
+        loss = torch.stack(total_loss).mean() * weight
+        return loss
+    
+    
     def compute_attn_pca_loss(self, cond_control_ids, cond_example_ids, cond_appearance_ids, step_i):
         """
         Compute the PCA Semantic loss based on the given condition control, example, and appearance IDs.
@@ -1037,10 +1296,12 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps * num_batch) as progress_bar:
             for i, t in enumerate(timesteps):
+             
                 if i >= num_save_steps:
                     break
                 # create dict to store the hidden features
                 attn_key_dict = dict()
+                conv_feat_dict = dict()
 
                 for latent_id, latents in enumerate(latent_list):
                     # expand the latents if we are doing classifier free guidance
@@ -1121,6 +1382,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                 # Only process for the first num_save_steps
                 if i < num_save_steps:
                     process_feat_dict(attn_key_dict)
+                    process_feat_dict(conv_feat_dict)
 
                     self.pca_info[i] = {
                         'attn_key': attn_key_dict,

@@ -26,7 +26,7 @@ def freecontrol_generate(condition_image, prompt, scale, ddim_steps, sd_version,
 
     if not control_type == "None":
         if control_type.lower() == "landmark" :
-            processor = make_processor("openpose")
+            processor = make_processor("scribble")
             landmark2d_processor = make_processor("landmark")
             
         else:
@@ -98,33 +98,52 @@ def freecontrol_generate(condition_image, prompt, scale, ddim_steps, sd_version,
     inversion_config = config.data.inversion
     
     # Processor the condition image
-    
-    coords_tensor = None
-    if control_type.lower() == 'landmark':  
-        img = processor(condition_image)
-        landmark2d_img, landmark2d = landmark2d_processor(condition_image)
-        original_w, original_h = img.size  # ex: 512 x 512
-        condition_image_latents = pipeline.invert(img=img, inversion_config=inversion_config) # dict_keys(['prompt', 'all_latents', 'img', 'pil_img', 'prompt_embeds'])
-        # scaling
-        last_latent = list(condition_image_latents['all_latents'].values())[-1]
-        _, _, latent_h, latent_w = last_latent.shape  # torch.Size([1, 4, 64, 64])
-        coords_tensor = landmark2d.clone()
-        coords_tensor[:, 0] *= latent_w / original_w
-        coords_tensor[:, 1] *= latent_h / original_h
-        
-        
-    else: img = processor(condition_image)
-    # flip the color for the scribble and canny: black background to white background
-    if control_type == "scribble" or control_type == "canny":
+    # === condition image 처리 ===
+    img = processor(condition_image)
+    if control_type.lower() in ["scribble", "canny"]:
         img = Image.fromarray(255 - np.array(img))
-        condition_image_latents = pipeline.invert(img=img, inversion_config=inversion_config)
+
+    condition_image_latents = pipeline.invert(img=img, inversion_config=inversion_config)
+
+    reference_image_latents = None
+    coords_tensor = None
+    original_h, original_w = None, None
+    landmark2dimg = None
+
+    if control_type.lower() == "landmark":
+        # landmark2d 이미지 및 좌표 추출
+        landmark2dimg, landmark2d = landmark2d_processor(condition_image)
+        original_w, original_h = condition_image.size
+
+        reference_image_latents = pipeline.invert(img=condition_image, inversion_config=inversion_config)
+
+        last_latent = list(condition_image_latents['all_latents'].values())[-1]
+        _, _, latent_h, latent_w = last_latent.shape
         
-
-    # condition_image_latents = pipeline.invert(img=img, inversion_config=inversion_config)
-    
-
-    inverted_data = {"condition_input": [condition_image_latents], "landmark":[coords_tensor]}
-
+        
+        
+        if landmark2d is not None:
+            coords_tensor = landmark2d.clone()
+            coords_tensor[:, 0] *= latent_w / original_w
+            coords_tensor[:, 1] *= latent_h / original_h
+            print("coords_tensor", latent_w , original_w)
+        
+        if coords_tensor is not None:
+            inverted_data = {
+                "condition_input": [condition_image_latents],
+                "reference_input": [reference_image_latents],
+                "landmark": [coords_tensor],
+                "original_size": (original_h, original_w)
+            }
+        else:
+            inverted_data = {
+            "condition_input": [condition_image_latents]
+        }
+            
+    else:
+        inverted_data = {
+            "condition_input": [condition_image_latents]
+        }
     g = torch.Generator()
     g.manual_seed(config.sd_config.seed)
 
@@ -136,10 +155,18 @@ def freecontrol_generate(condition_image, prompt, scale, ddim_steps, sd_version,
                         inverted_data=inverted_data)[0]
 
     # Display the result：
-    # if the control type is not none, then we display [condition_image, output_image, output_image_with_control]
+    # if the control type is not none, then we display [condition_image, landmark_image, output_image, output_image_with_control]
     # if the control type is none, then we display [condition_image, output_image]
-    if control_type != "None":
-        img_list.insert(0, img)
+    if control_type.lower() == "landmark":
+        print("landmark2dimg type:", type(landmark2dimg))
+        print("img type:", type(img))
+        print("img_list before insert:", len(img_list))
+
+        img_list.insert(0, landmark2dimg)  # landmark 시각화 이미지
+        img_list.insert(0, img)            # 조건 이미지 (scribble 기반)
+    elif control_type != "None":
+        img_list.insert(0, img)  
+        
     return img_list
 
 
@@ -246,14 +273,14 @@ def main():
 
             with gr.Column():
                 prompt = gr.Textbox(label="Generation Prompt: prompt to generate target image",
-                                    value="A photo of a women with pink hair")
+                                    value="A photo of a woman with pink hair")
                 inversion_prompt = gr.Textbox(label="Inversion Prompt to invert the condition image",
-                                              value="A photo of a women")
+                                              value="A photo of a woman")
                 paired_objs = gr.Textbox(
                     label="Paired subject: Please selected the paired subject from the inverson prompt and generation prompt."
                           "Then input in the format like (obj from inversion prompt; obj from generation prompt)"
                           "e.g. (dog; lion)",
-                    value="(women; women with pink hair)")
+                    value="(woman; woman with pink hair)")
                 run_button = gr.Button(value="Run")
                 with gr.Accordion("options", open=True):
                     scale = gr.Slider(label="Guidance Scale", minimum=0.1, maximum=30.0, value=7.5, step=0.1)
